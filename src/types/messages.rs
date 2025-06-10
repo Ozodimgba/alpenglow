@@ -54,7 +54,46 @@ pub struct SkipCertificate {
     pub total_stake: u64,
 }
 
-// All possible message types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FastFinalCertificate {
+    pub slot: Slot,
+    pub block_hash: Hash,
+    pub votes: Vec<NotarVote>,
+    pub total_stake: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]  
+pub struct FinalVote {
+    pub slot: Slot,
+    pub validator_id: ValidatorId,
+}
+
+/// chain Synchronization Messages
+/// 
+/// based on whitepaper "Asynchrony in Practice" - joining
+/// 
+/// when a node goes offline or newly joins, it needs to sync with the current
+/// network state before participating in consensus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainSyncRequest {
+    /// validator requesting chain sync
+    pub from_validator: ValidatorId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]  
+pub struct ChainSyncResponse {
+    /// latest block that has achieved deterministic finality
+    /// alpenglow Definition 14: Block Finalization
+    pub latest_finalized_slot: Slot,
+    pub latest_finalized_hash: Hash,
+    
+    pub current_slot: Slot,
+    
+    /// recent blocks for fast catch-up
+    /// "retrieve any missing blocks for all slots in parallel"
+    pub recent_blocks: Vec<Block>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AlpenglowMessage {
     // Block dissemination
@@ -73,6 +112,12 @@ pub enum AlpenglowMessage {
     
     // Block requests (for repair later)
     BlockRequest { slot: Slot, from: ValidatorId },
+
+    FinalVote(FinalVote),                       
+    FastFinalCertificate(FastFinalCertificate),
+
+    ChainSyncRequest(ChainSyncRequest),
+    ChainSyncResponse(ChainSyncResponse),
 }
 
 impl Block {

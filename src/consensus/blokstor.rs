@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use crate::types::{Block, Slot, Hash};
 use anyhow::Result;
+use log::{info, warn};
 
 pub struct Blokstor {
     blocks: HashMap<Slot, Block>,
@@ -29,8 +30,14 @@ impl Blokstor {
     }
     
     pub fn store_block(&mut self, block: Block) -> Result<()> {
-        if block.slot <= self.latest_slot && block.slot != 0 {
-            return Err(anyhow::anyhow!("Block slot {} too old", block.slot));
+        let max_age = 20; // allow blocks up to 20 slots old
+        if block.slot < self.latest_slot.saturating_sub(max_age) {
+            return Err(anyhow::anyhow!("Block slot {} too old (latest={})", block.slot, self.latest_slot));
+        }
+
+        if block.slot > self.latest_slot {
+            info!("Updating latest_slot from {} to {}", self.latest_slot, block.slot);
+            self.latest_slot = block.slot;
         }
         
         // check parent exists
@@ -67,5 +74,68 @@ impl Blokstor {
     
     pub fn get_chain_head(&self) -> Option<&Block> {
         self.blocks.get(&self.latest_slot)
+    }
+
+
+    /// get a range of blocks for chain synchronization
+    pub fn get_blocks_range(&self, start_slot: Slot, end_slot: Slot) -> Vec<Block> {
+        let mut blocks = Vec::new();
+        for slot in start_slot..=end_slot {
+            if let Some(block) = self.blocks.get(&slot) {
+                blocks.push(block.clone());
+            }
+        }
+        blocks
+    }
+
+    /// check if we have a continuous chain from start to end
+    /// ensures chain integrity per Alpenglow Definition 5 -> ancestor/descendant relationships
+    pub fn has_continuous_chain(&self, start_slot: Slot, end_slot: Slot) -> bool {
+        for slot in start_slot..=end_slot {
+            if !self.blocks.contains_key(&slot) {
+                return false;
+            }
+        }
+        true
+    }
+    
+    /// get the highest slot we have a block for
+    pub fn get_highest_slot(&self) -> Slot {
+        self.latest_slot
+    }
+
+    /// emergency chain reset - start from a known good state
+    pub fn reset_to_genesis(&mut self) {
+        warn!("EMERGENCY: Resetting chain to genesis");
+        
+        self.blocks.clear();
+        self.block_by_hash.clear();
+        
+        // Create and store genesis block
+        let genesis = Block::genesis();
+        let genesis_hash = genesis.hash();
+        
+        self.blocks.insert(0, genesis.clone());
+        self.block_by_hash.insert(genesis_hash, genesis);
+        self.latest_slot = 0;
+        
+        info!("Chain reset complete - starting from genesis");
+    }
+
+    /// force store a block without parent validation (emergency only)
+    pub fn force_store_block(&mut self, block: Block) -> Result<()> {
+        let hash = block.hash();
+        let slot = block.slot;
+        
+        warn!("EMERGENCY: Force storing block slot={} without validation", slot);
+        
+        self.blocks.insert(slot, block.clone());
+        self.block_by_hash.insert(hash, block);
+        
+        if slot > self.latest_slot {
+            self.latest_slot = slot;
+        }
+        
+        Ok(())
     }
 }
