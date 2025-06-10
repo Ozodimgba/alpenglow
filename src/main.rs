@@ -1,21 +1,24 @@
 use std::{env, net::SocketAddr};
 
 use alpenglow_mini::{
-    consensus::{self, Blokstor, Pool, Votor}, 
+    consensus::{self, Blokstor, Pool, Rotor, Votor}, 
     leader::{BlockBuilder, LeaderSchedule}, 
     network::NetworkManager, 
-    types::{AlpenglowMessage, Block, ChainSyncRequest, ChainSyncResponse, NetworkConfig, Slot, ValidatorId, ValidatorInfo}
+    types::{AlpenglowMessage, Block, ChainSyncRequest, ChainSyncResponse, KeyPair, NetworkConfig, Slot, ValidatorId, ValidatorInfo}
 };
 
 use tokio::time::{interval, Duration};
 use anyhow::Result;
 use log::{info, warn, error, debug, trace};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 struct AlpenglowNode {
-    network: NetworkManager,
+    network: Arc<Mutex<NetworkManager>>,
     blokstor: Blokstor,
     pool: Pool,   
-    votor: Votor,   
+    votor: Votor,
+    rotor: Rotor,   
     leader_schedule: LeaderSchedule,
     block_builder: BlockBuilder,
     validator_id: ValidatorId,
@@ -25,7 +28,7 @@ struct AlpenglowNode {
 impl AlpenglowNode {
     pub async fn new(config: NetworkConfig) -> Result<Self> {
         let validator_id = config.local_validator_id.clone();
-        let network = NetworkManager::new(config.clone()).await?;
+        let network = Arc::new(Mutex::new(NetworkManager::new(config.clone()).await?));
         
         let validators: Vec<ValidatorId> = config.validators.iter()
             .map(|v| v.id.clone())
@@ -34,12 +37,17 @@ impl AlpenglowNode {
         info!("Initialized AlpenglowNode validator_id={}", validator_id);
         debug!("Network configuration: {} validators, total_stake={}", 
                config.validators.len(), config.total_stake());
+
+        let keypair = KeyPair::new(validator_id.clone());
+
+        let rotor_network = network.clone();
         
         Ok(AlpenglowNode {
             network,
             blokstor: Blokstor::new(),
             pool: Pool::new(config.clone()),
             votor: Votor::new(validator_id.clone(), config.clone()),
+            rotor: Rotor::new(config.clone(), rotor_network, validator_id.clone(), keypair, None)?,
             leader_schedule: LeaderSchedule::new(validators),
             block_builder: BlockBuilder::new(validator_id.clone()),
             validator_id,
@@ -74,7 +82,7 @@ impl AlpenglowNode {
         self.join_network().await?;
 
         // send hello to all peers
-        self.network.broadcast(&AlpenglowMessage::Hello { 
+        self.network.lock().await.broadcast(&AlpenglowMessage::Hello { 
             from: self.validator_id.clone() 
         }).await?;
         
@@ -83,8 +91,18 @@ impl AlpenglowNode {
         
         loop {
             tokio::select! {
-                Ok((peer_id, msg)) = self.network.receive() => {
-                    self.handle_message(peer_id, msg).await?;
+                result = async {
+                    let network_guard = self.network.lock().await;
+                    network_guard.receive().await
+                } => {
+                    match result {
+                        Ok((peer_id, msg)) => {
+                            self.handle_message(peer_id, msg).await?;
+                        }
+                        Err(e) => {
+                            error!("Network receive error: {}", e);
+                        }
+                    }
                 }
                 
                 _ = slot_timer.tick() => {
@@ -92,16 +110,16 @@ impl AlpenglowNode {
                 }
 
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                let pool_events = self.pool.drain_events();
-                if !pool_events.is_empty() {
-                    self.handle_pool_events(pool_events).await?;
+                    let pool_events = self.pool.drain_events();
+                    if !pool_events.is_empty() {
+                        self.handle_pool_events(pool_events).await?;
+                    }
+                    
+                    let votor_events = self.votor.drain_events();
+                    if !votor_events.is_empty() {
+                        self.handle_votor_events(votor_events).await?;
+                    }
                 }
-                
-                let votor_events = self.votor.drain_events();
-                if !votor_events.is_empty() {
-                    self.handle_votor_events(votor_events).await?;
-                }
-            }
             }
         }
     }
@@ -185,6 +203,21 @@ impl AlpenglowNode {
             // these are processed in join_network()
             AlpenglowMessage::ChainSyncResponse(_) => {
                 debug!("Received chain sync response (handled in join_network)");
+            }
+
+            AlpenglowMessage::Shred(shred) => {
+                debug!("Received shred slot={} slice_index={} shred_index={} from peer_id={}", 
+                    shred.slot, shred.slice_index, shred.shred_index, peer_id);
+                
+                // TODO: Add ShredReceiver to handle shred reconstruction
+                // just log that we received it
+                trace!("Shred handling not yet implemented");
+            }
+            
+            AlpenglowMessage::SliceRequest { slot, slice_index, from } => {
+                debug!("Received slice request slot={} slice_index={} from={}", 
+                    slot, slice_index, from);
+                // TODO: Handle slice repair requests
             }
         
             _ => {
@@ -280,8 +313,8 @@ impl AlpenglowNode {
                             let votor_events = self.votor.handle_block_received(block_slot, block_hash);
                             self.handle_votor_events(votor_events).await?;
                             
-                            // broadcast to peers
-                            self.network.broadcast(&AlpenglowMessage::Block(block)).await?;
+                            // broadcast to peers // now use rotor
+                            self.rotor.disseminate_block(block).await?;
                             info!("Successfully broadcast block slot={}", block_slot);
                         }
                         Err(e) => {
@@ -323,17 +356,17 @@ impl AlpenglowNode {
                 consensus::PoolEvent::BlockNotarized { slot, block_hash, certificate } => {
                     info!("Block notarized slot={} block_hash={}", slot, format_hash(&block_hash));
 
-                    self.network.broadcast(&AlpenglowMessage::NotarCertificate(certificate)).await?;
+                    self.network.lock().await.broadcast(&AlpenglowMessage::NotarCertificate(certificate)).await?;
                 }
                 consensus::PoolEvent::FastFinalized { slot, block_hash, certificate } => {
                     info!("Block fast-finalized slot={} block_hash={}", slot, format_hash(&block_hash));
                     
-                    self.network.broadcast(&AlpenglowMessage::FastFinalCertificate(certificate)).await?;
+                    self.network.lock().await.broadcast(&AlpenglowMessage::FastFinalCertificate(certificate)).await?;
                 }
                 consensus::PoolEvent::SlotSkipped { slot, certificate } => {
                     info!("Slot skipped slot={}", slot);
                     
-                    self.network.broadcast(&AlpenglowMessage::SkipCertificate(certificate)).await?;
+                    self.network.lock().await.broadcast(&AlpenglowMessage::SkipCertificate(certificate)).await?;
                 }
             }
         }
@@ -346,7 +379,7 @@ impl AlpenglowNode {
                 consensus::VotorEvent::ShouldCastVote { vote } => {
                     info!("Votor decided to cast vote type={}", message_type(&vote));
                     
-                    self.network.broadcast(&vote).await?;
+                    self.network.lock().await.broadcast(&vote).await?;
                     debug!("Broadcast vote type={} to network", message_type(&vote));
                     
                     // add our own vote to the pool
@@ -404,14 +437,14 @@ impl AlpenglowNode {
         debug!("Broadcasting chain sync request to discover network state");
         
         // broadcast request to all known peers
-        self.network.broadcast(&AlpenglowMessage::ChainSyncRequest(ChainSyncRequest {
+        self.network.lock().await.broadcast(&AlpenglowMessage::ChainSyncRequest(ChainSyncRequest {
             from_validator: self.validator_id.clone(),
         })).await?;
         
         // timeout prevents infinite waiting if network is empty
         let timeout = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Ok((peer_id, msg)) = self.network.receive().await {
+                if let Ok((peer_id, msg)) = self.network.lock().await.receive().await {
                     if let AlpenglowMessage::ChainSyncResponse(response) = msg {
                         debug!("Received chain sync from peer_id={} latest_finalized={} current={}", 
                                peer_id, response.latest_finalized_slot, response.current_slot);
@@ -481,7 +514,7 @@ impl AlpenglowNode {
                latest_finalized, self.current_slot, response.recent_blocks.len());
         
         // send directly to requesting node
-        self.network.send_to(&request.from_validator, 
+        self.network.lock().await.send_to(&request.from_validator, 
                             &AlpenglowMessage::ChainSyncResponse(response)).await?;
         
         Ok(())
@@ -590,17 +623,17 @@ fn load_config(validator_id: &str) -> Result<NetworkConfig> {
     let validators = vec![
         ValidatorInfo {
             id: "alice".to_string(),
-            address: "127.0.0.1:8001".parse::<SocketAddr>()?,
+            address: "127.0.0.1:9001".parse::<SocketAddr>()?,
             stake: 100,
         },
         ValidatorInfo {
             id: "bob".to_string(),
-            address: "127.0.0.1:8002".parse::<SocketAddr>()?,
+            address: "127.0.0.1:9002".parse::<SocketAddr>()?,
             stake: 100,
         },
         ValidatorInfo {
             id: "charlie".to_string(),
-            address: "127.0.0.1:8003".parse::<SocketAddr>()?,
+            address: "127.0.0.1:9003".parse::<SocketAddr>()?,
             stake: 100,
         },
     ];
@@ -632,7 +665,7 @@ fn message_type(msg: &AlpenglowMessage) -> &'static str {
         AlpenglowMessage::Block(_) => "Block",
         AlpenglowMessage::NotarVote(_) => "NotarVote",
         AlpenglowMessage::SkipVote(_) => "SkipVote",
-        AlpenglowMessage::FinalVote(_) => "FinalVote",   
+        AlpenglowMessage::FinalVote(_) => "FinalVote",
         AlpenglowMessage::NotarCertificate(_) => "NotarCertificate",
         AlpenglowMessage::SkipCertificate(_) => "SkipCertificate",
         AlpenglowMessage::FastFinalCertificate(_) => "FastFinalCertificate",
@@ -640,6 +673,8 @@ fn message_type(msg: &AlpenglowMessage) -> &'static str {
         AlpenglowMessage::BlockRequest { .. } => "BlockRequest",
         AlpenglowMessage::ChainSyncRequest(_) => "ChainSyncRequest",
         AlpenglowMessage::ChainSyncResponse(_) => "ChainSyncResponse",
+        AlpenglowMessage::Shred(_) => "Shred",
+        AlpenglowMessage::SliceRequest { .. } => "SliceRequest",
     }
 }
 

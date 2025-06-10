@@ -1,24 +1,25 @@
 use sha2::{Sha256, Digest};
 use super::messages::{Hash, Signature, ValidatorId};
+use bls_signatures::{PrivateKey, PublicKey, Serialize, Signature as BlsSignature};
 
 #[derive(Debug, Clone)]
 pub struct KeyPair {
     pub validator_id: ValidatorId,
-    pub private_key: [u8; 32],
-    pub public_key: [u8; 32],
+    pub private_key: PrivateKey,
+    pub public_key: PublicKey,
 }
 
 impl KeyPair {
     pub fn new(validator_id: ValidatorId) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(validator_id.as_bytes());
-        hasher.update(b"private");
-        let private_key = hasher.finalize().into();
+        hasher.update(b"bls_seed");
+        let seed: [u8; 32] = hasher.finalize().into();
         
-        let mut hasher = Sha256::new();
-        hasher.update(validator_id.as_bytes());
-        hasher.update(b"public");
-        let public_key = hasher.finalize().into();
+        let private_key = PrivateKey::from_bytes(&seed)
+            .expect("Failed to create BLS private key");
+        
+        let public_key = private_key.public_key();
         
         KeyPair {
             validator_id,
@@ -27,22 +28,12 @@ impl KeyPair {
         }
     }
     
-    // placeholder signature: just hash the data
-    pub fn sign(&self, data: &[u8]) -> Signature {
-        let mut hasher = Sha256::new();
-        hasher.update(&self.private_key);
-        hasher.update(data);
-        let hash = hasher.finalize();
-        
-        let mut sig = [0u8; 64];
-        sig[..32].copy_from_slice(&hash);
-        sig[32..].copy_from_slice(&self.validator_id.as_bytes()[..32.min(self.validator_id.len())]);
-        sig
+    pub fn sign(&self, data: &[u8]) -> BlsSignature {
+        self.private_key.sign(data)
     }
     
-    pub fn verify(&self, data: &[u8], signature: &Signature) -> bool {
-        let expected = self.sign(data);
-        expected == *signature
+    pub fn verify(&self, data: &[u8], signature: &BlsSignature) -> bool {
+        self.public_key.verify(*signature, data)
     }
 }
 

@@ -37,6 +37,7 @@ pub struct Votor {
     validator_id: ValidatorId,
     network_config: NetworkConfig,
     
+    keypair: KeyPair,  
     // Track our voting state per slot
     slot_states: HashMap<Slot, SlotState>,
     
@@ -81,10 +82,14 @@ impl Default for SlotState {
 impl Votor {
     pub fn new(validator_id: ValidatorId, network_config: NetworkConfig) -> Self {
         info!("Initializing Votor validator_id={}", validator_id);
+
+        // generate keypair for this validator
+        let keypair = KeyPair::new(validator_id.clone());
         
         Votor {
             validator_id,
             network_config,
+            keypair,
             slot_states: HashMap::new(),
             slot_timeouts: HashMap::new(),
             pending_events: Vec::new(),
@@ -96,6 +101,10 @@ impl Votor {
         debug!("Votor handling block received slot={} block_hash={}", slot, format_hash(&block_hash));
         
         let mut events = vec![];
+
+        let vote_data = self.create_vote_data(slot, block_hash);
+        let signature = self.keypair.sign(&vote_data);
+
         let state = self.slot_states.entry(slot).or_default();
         
         state.received_block = Some(block_hash);
@@ -111,10 +120,12 @@ impl Votor {
             && state.received_block == Some(block_hash);
 
         if should_vote {
+
             let vote = NotarVote {
                 slot,
                 block_hash,
                 validator_id: self.validator_id.clone(),
+                signature,
             };
             
             state.cast_notar_vote = Some(block_hash);
@@ -128,6 +139,15 @@ impl Votor {
         self.pending_events.extend(events.clone());
         events
     }
+
+    // helper method to create consistent vote data for signing
+    fn create_vote_data(&self, slot: Slot, block_hash: Hash) -> Vec<u8> {
+        let mut vote_data = Vec::new();
+        vote_data.extend_from_slice(&slot.to_le_bytes());
+        vote_data.extend_from_slice(&block_hash);
+        vote_data.extend_from_slice(self.validator_id.as_bytes());
+        vote_data
+    }
     
     /// r\eact to Pool events - certificates being created
     pub fn handle_pool_event(&mut self, event: PoolEvent) -> Vec<VotorEvent> {
@@ -136,6 +156,9 @@ impl Votor {
         match event {
             PoolEvent::BlockNotarized { slot, block_hash, .. } => {
                 debug!("Votor handling block notarized slot={} block_hash={}", slot, format_hash(&block_hash));
+
+                let final_vote_data = self.create_final_vote_data(slot);
+                let signature = self.keypair.sign(&final_vote_data);
                 
                 let state = self.slot_states.entry(slot).or_default();
                 state.block_notarized = true;
@@ -143,9 +166,11 @@ impl Votor {
                 // voted for this block and it got notarized -> cast final vote
                 if let Some(our_vote_hash) = state.cast_notar_vote {
                     if our_vote_hash == block_hash && !state.cast_final_vote {
+
                         let final_vote = FinalVote {
                             slot,
                             validator_id: self.validator_id.clone(),
+                            signature
                         };
                         
                         state.cast_final_vote = true;
@@ -180,19 +205,35 @@ impl Votor {
         self.pending_events.extend(events.clone());
         events
     }
+
+    fn create_final_vote_data(&self, slot: Slot) -> Vec<u8> {
+        let mut vote_data = Vec::new();
+        vote_data.extend_from_slice(&slot.to_le_bytes());
+        vote_data.extend_from_slice(b"FINAL");  // Add final marker
+        vote_data.extend_from_slice(self.validator_id.as_bytes());
+        vote_data
+    }
     
     /// decide whether to skip the slot
     pub fn handle_slot_timeout(&mut self, slot: Slot) -> Vec<VotorEvent> {
         debug!("Votor handling slot timeout slot={}", slot);
         
         let mut events = vec![];
+
+        // re-check signture for skip vote?
+        let skip_data = self.create_skip_vote_data(slot);
+        let signature = self.keypair.sign(&skip_data);
+
+
         let state = self.slot_states.entry(slot).or_default();
         
         // haven't voted yet and no block received ? -> vote to skip
         if state.cast_notar_vote.is_none() && !state.cast_skip_vote && state.received_block.is_none() {
+
             let skip_vote = SkipVote {
                 slot,
                 validator_id: self.validator_id.clone(),
+                signature,
             };
             
             state.cast_skip_vote = true;
@@ -207,6 +248,14 @@ impl Votor {
         events
     }
     
+    fn create_skip_vote_data(&self, slot: Slot) -> Vec<u8> {
+        let mut vote_data = Vec::new();
+        vote_data.extend_from_slice(&slot.to_le_bytes());
+        vote_data.extend_from_slice(b"SKIP");  // add skip marker
+        vote_data.extend_from_slice(self.validator_id.as_bytes());
+        vote_data
+    }
+
     /// called when slot begins
     pub fn set_slot_timeout(&mut self, slot: Slot, timeout_duration: Duration) {
         let timeout_time = Instant::now() + timeout_duration;

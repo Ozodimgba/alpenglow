@@ -181,12 +181,12 @@ impl Pool {
         for action in certificate_actions {
             match action {
                 CertificateAction::CreateFastFinal { slot, block_hash, votes, stake } => {
-                    let cert = FastFinalCertificate { slot, block_hash, votes, total_stake: stake };
+                    let cert = FastFinalCertificate { slot, block_hash, total_stake: stake, aggregated_signature: todo!(), signing_validators: todo!() };
                     self.certificates.entry(slot).or_default().fast_final_cert = Some(cert.clone());
                     events.push(PoolEvent::FastFinalized { slot, block_hash, certificate: cert });
                 }
                 CertificateAction::CreateNotar { slot, block_hash, votes, stake } => {
-                    let cert = NotarCertificate { slot, block_hash, votes, total_stake: stake };
+                    let cert = NotarCertificate { slot, block_hash, total_stake: stake, aggregated_signature: todo!(), signing_validators: todo!() };
                     self.certificates.entry(slot).or_default().notar_cert = Some(cert.clone());
                     events.push(PoolEvent::BlockNotarized { slot, block_hash, certificate: cert });
                 }
